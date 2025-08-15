@@ -104,7 +104,8 @@ class Gen3cPipeline(DiffusionVideo2WorldGenerationPipeline):
             config_file="cosmos_predict1/diffusion/config/config.py",
             model_class=DiffusionGen3CModel,
         )
-        self.model.state_shape = [16, 16, 40, 72]
+        assert self.height % 8 == 0 and self.width % 8 == 0, "Height and width must be divisible by 8"
+        self.model.state_shape = [16, 16, self.height // 8, self.width // 8]
 
     def generate(
         self,
