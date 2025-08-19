@@ -215,3 +215,117 @@ class VideoExtendGeneralDIT(GeneralDIT):
             "extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D": extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
         }
         return output
+
+    def forward_features(
+        self,
+        x: torch.Tensor,
+        timesteps: torch.Tensor,
+        crossattn_emb: torch.Tensor,
+        crossattn_mask: Optional[torch.Tensor] = None,
+        fps: Optional[torch.Tensor] = None,
+        image_size: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
+        scalar_feature: Optional[torch.Tensor] = None,
+        data_type: Optional[DataType] = DataType.VIDEO,
+        video_cond_bool: Optional[torch.Tensor] = None,
+        condition_video_indicator: Optional[torch.Tensor] = None,
+        condition_video_input_mask: Optional[torch.Tensor] = None,
+        condition_video_augment_sigma: Optional[torch.Tensor] = None,
+        condition_video_pose: Optional[torch.Tensor] = None,
+        layers = None,
+        original_indices = None,
+        **kwargs,
+    ):
+        """Forward pass of the video-conditioned DIT model.
+
+        Args:
+            x: Input tensor of shape (B, C, T, H, W)
+            timesteps: Timestep tensor of shape (B,)
+            crossattn_emb: Cross attention embeddings of shape (B, N, D)
+            crossattn_mask: Optional cross attention mask of shape (B, N)
+            fps: Optional frames per second tensor
+            image_size: Optional image size tensor
+            padding_mask: Optional padding mask tensor
+            scalar_feature: Optional scalar features tensor
+            data_type: Type of data being processed (default: DataType.VIDEO)
+            video_cond_bool: Optional video conditioning boolean tensor
+            condition_video_indicator: Optional video condition indicator tensor
+            condition_video_input_mask: Required mask tensor for video data type
+            condition_video_augment_sigma: Optional sigma values for conditional input augmentation
+            **kwargs: Additional keyword arguments
+
+        Returns:
+            torch.Tensor: Output tensor
+        """
+        B, C, T, H, W = x.shape
+
+        if data_type == DataType.VIDEO:
+            assert condition_video_input_mask is not None, "condition_video_input_mask is required for video data type"
+
+            if self.cp_group is not None:
+                condition_video_input_mask = split_inputs_cp(
+                    condition_video_input_mask, seq_dim=2, cp_group=self.cp_group
+                )
+                condition_video_indicator = split_inputs_cp(
+                    condition_video_indicator, seq_dim=2, cp_group=self.cp_group
+                )
+                if condition_video_pose is not None:
+                    condition_video_pose = split_inputs_cp(condition_video_pose, seq_dim=2, cp_group=self.cp_group)
+
+            input_list = [x, condition_video_input_mask]
+            if condition_video_pose is not None:
+                input_list.append(condition_video_pose) 
+            x = torch.cat(
+                input_list,
+                dim=1,
+            )
+
+        inputs = self.forward_before_blocks(
+            x=x,
+            timesteps=timesteps,
+            crossattn_emb=crossattn_emb,
+            crossattn_mask=crossattn_mask,
+            fps=fps,
+            image_size=image_size,
+            padding_mask=padding_mask,
+            scalar_feature=scalar_feature,
+            data_type=data_type,
+            condition_video_augment_sigma=condition_video_augment_sigma,
+            **kwargs,
+        )
+        x, affline_emb_B_D, crossattn_emb, crossattn_mask, rope_emb_L_1_1_D, adaln_lora_B_3D, original_shape = (
+            inputs["x"],
+            inputs["affline_emb_B_D"],
+            inputs["crossattn_emb"],
+            inputs["crossattn_mask"],
+            inputs["rope_emb_L_1_1_D"],
+            inputs["adaln_lora_B_3D"],
+            inputs["original_shape"],
+        )
+        extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = inputs["extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D"]
+        if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
+            assert (
+                x.shape == extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape
+            ), f"{x.shape} != {extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape} {original_shape}"
+
+        embeds = []
+        for block_idx, (_, block) in enumerate(self.blocks.items()):
+            assert (
+                self.blocks["block0"].x_format == block.x_format
+            ), f"First block has x_format {self.blocks[0].x_format}, got {block.x_format}"
+
+            x = block(
+                x,
+                affline_emb_B_D,
+                crossattn_emb,
+                crossattn_mask,
+                rope_emb_L_1_1_D=rope_emb_L_1_1_D,
+                adaln_lora_B_3D=adaln_lora_B_3D,
+                extra_per_block_pos_emb=extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
+            )
+            if block_idx in layers:
+                embeds.append(rearrange(x, "T H W B D -> B T D H W")[:, original_indices, ...])  # (B,F,C,H,W)
+                if len(embeds) == len(layers):
+                    return embeds[0] if len(layers) == 1 else embeds
+        
+        return None
